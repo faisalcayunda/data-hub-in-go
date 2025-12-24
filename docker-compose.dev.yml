@@ -1,0 +1,136 @@
+services:
+  api:
+    image: 10.25.255.133:5000/portal-data-backend:${IMAGE_TAG}
+    container_name: portal-data-api
+    restart: unless-stopped
+    ports:
+      - "5678:5000"
+    env_file:
+      - .env
+      - .env.db
+    pull_policy: always
+    command: gunicorn -c gunicorn.conf.py app:app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    labels:
+      io.portainer.accesscontrol.teams: portal-data
+    networks:
+      - portal-data-network
+
+  minio:
+    # image: minio/minio:RELEASE.2024-01-18T22-51-28Z-cpuv1
+    image: minio/minio:latest
+    container_name: portal-data-minio
+    restart: unless-stopped
+    ports:
+      - "9900:9000"
+      - "9901:9001"
+    volumes:
+      - ./data/minio/volumes:/data
+    env_file:
+      - .env.db
+    command: server /data --console-address ":9001"
+    labels:
+      io.portainer.accesscontrol.teams: portal-data
+    networks:
+      - portal-data-network
+  postgres:
+    # image: 10.25.255.133:5000/portal-data-db:${IMAGE_TAG}
+    build:
+      context: .
+      dockerfile: .docker/database/DockerFile
+      cache_from:
+        - 10.25.255.133:5000/portal-data-db:${IMAGE_TAG}
+    container_name: portal-data-postgresql
+    restart: unless-stopped
+    env_file:
+      - .env.db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: Asia/Jakarta
+    volumes:
+      - portal-data-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    labels:
+      io.portainer.accesscontrol.teams: portal-data
+    networks:
+      - portal-data-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: portal-data-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    env_file:
+      - .env.db
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    labels:
+      io.portainer.accesscontrol.teams: portal-data
+    networks:
+      - portal-data-network
+
+  convex-backend:
+    image: ghcr.io/get-convex/convex-backend:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-3210}:3210"
+      - "${SITE_PROXY_PORT:-3211}:3211"
+    volumes:
+      - ./data:/convex/data
+    environment:
+      CONVEX_ADMIN_KEY: "${CONVEX_ADMIN_KEY}"
+      POSTGRES_URL: "${POSTGRES_URL}"
+      CONVEX_CLOUD_ORIGIN: "http://${CONVEX_HOST:-103.127.98.75}:${PORT:-3210}"
+      CONVEX_SITE_ORIGIN: "http://${CONVEX_HOST:-103.127.98.75}:${SITE_PROXY_PORT:-3211}"
+      DO_NOT_REQUIRE_SSL: "${DO_NOT_REQUIRE_SSL}"
+      DISABLE_BEACON: "${DISABLE_BEACON}"
+      DOCUMENT_RETENTION_DELAY: "${DOCUMENT_RETENTION_DELAY}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3210/version"]
+      interval: 5s
+      start_period: 10s
+    networks:
+      - portal-data-network
+
+  convex-dashboard:
+    image: ghcr.io/get-convex/convex-dashboard:latest
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    env_file:
+      - .env
+    ports:
+      - "${DASHBOARD_PORT:-6791}:6791"
+    environment:
+      PORT: "${DASHBOARD_PORT:-6791}"
+      CONVEX_ADMIN_KEY: "${CONVEX_ADMIN_KEY}"
+      NEXT_PUBLIC_DEPLOYMENT_URL: "${NEXT_PUBLIC_DEPLOYMENT_URL}"
+    depends_on:
+      convex-backend:
+        condition: service_healthy
+    networks:
+      - portal-data-network
+
+volumes:
+  portal-data-postgres:
+
+networks:
+  portal-data-network:
+    external: true

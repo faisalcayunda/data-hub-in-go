@@ -1,0 +1,137 @@
+name: Deploy to SSH Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Export Backend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./.docker/app/DockerFile
+          tags: portal-data-backend:latest
+          outputs: type=docker,dest=/tmp/portal-data-backend.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Infisical CLI
+        run: |
+          set -e
+
+          echo "==> Adding Infisical APT repository..."
+          curl -1sLf 'https://dl.cloudsmith.io/public/infisical/infisical-cli/setup.deb.sh' | sudo -E bash
+
+          echo "==> Installing Infisical CLI..."
+          sudo apt-get update
+          sudo apt-get install -y infisical
+
+          echo "==> Verifying installation..."
+          infisical --version
+          which infisical
+
+
+      - name: Export secrets to .env.runtime
+        env:
+          INFISICAL_API_URL: ${{ secrets.INFISICAL_API_URL }}
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+
+        run: |
+          set -e
+          echo "Endpoint: $INFISICAL_API_URL"
+          echo "Token prefix: ${INFISICAL_TOKEN%%.*}..."
+
+          infisical export \
+            --env "${{ secrets.INFISICAL_ENV }}" \
+            --format=dotenv > .env.runtime
+
+          test -f .env.runtime || { echo "ERROR: .env.runtime tidak tercipta"; exit 1; }
+          echo "✓ .env.runtime dibuat. Total baris: $(wc -l < .env.runtime)"
+
+      - name: Prepare deployment files
+        run: |
+          mkdir -p deploy-files
+          mv /tmp/portal-data-backend.tar deploy-files/
+          cp docker-compose.yml deploy-files/
+          cp .env.runtime deploy-files/
+          ls -lh deploy-files/
+
+      - name: Copy files to server via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "deploy-files/*"
+          target: "/tmp/portal-deploy"
+          strip_components: 1
+          timeout: 600s
+          rm: true
+
+      - name: Deploy containers with docker compose
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+
+            echo "==> Loading Docker image..."
+            docker load -i /tmp/portal-deploy/portal-data-backend.tar
+
+            echo "==> Stopping existing containers..."
+            docker compose -f /tmp/portal-deploy/docker-compose.yml down 2>/dev/null || true
+
+            echo "==> Cleaning old images..."
+            docker image prune -af --filter "until=24h" || true
+
+            echo "==> Verifying deployment files..."
+            ls -lh /tmp/portal-deploy/
+
+            echo "==> Starting new containers..."
+            cd /tmp/portal-deploy
+            docker compose up -d --remove-orphans --force-recreate
+
+            echo "==> Checking container status..."
+            docker compose ps
+            docker compose logs --tail=50
+
+            echo "==> Cleaning up deployment files..."
+            rm -f /tmp/portal-deploy/portal-data-backend.tar
+
+            echo "✓ Deployment completed successfully"
+
+      - name: Health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sleep 10
+            cd /tmp/portal-deploy
+
+            if docker compose ps | grep -q "Up"; then
+              echo "✓ Containers are running"
+              docker compose ps
+            else
+              echo "✗ Some containers are not running"
+              docker compose ps
+              docker compose logs --tail=100
+              exit 1
+            fi
